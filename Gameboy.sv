@@ -416,9 +416,10 @@ always @(posedge clk_sys) begin
 		//write to RAM bank register
 		if(cart_wr && (cart_addr[15:13] == 3'b010)) begin
 			if (mbc3) begin
-				if (cart_di[3]==1)
+				if (cart_di[3]==1) begin
 					mbc3_mode <= 1'b1; //enable RTC
-				else begin
+					rtc_index <= cart_di[2:0];
+				end else begin
 					mbc3_mode <= 1'b0; //enable RAM
 					mbc_ram_bank_reg <= {2'b00,cart_di[1:0]};
 				end
@@ -796,6 +797,118 @@ assign ser_clk_in = USER_IN[0];
 assign USER_OUT[0] = sc_int_clock_out?ser_clk_out:1'b1;
 
 
+/////////////////////////////  RTC  ///////////////////////////////
+reg [2:0]  rtc_index;
+
+reg [25:0] rtc_subseconds;
+reg [5:0]  rtc_seconds;
+reg [5:0]  rtc_minutes;
+reg [4:0]  rtc_hours;
+reg [9:0]  rtc_days;
+reg		  rtc_overflow;
+reg		  rtc_halt;
+
+reg [7:0]  rtc_return;
+
+reg		  RTC_timestampNew = 0;
+reg [31:0] RTC_timestampIn = 0;	
+reg [31:0] RTC_timestampSaved = 0;
+reg [28:0] RTC_savedtimeIn = 0;	
+reg		  RTC_saveLoaded = 0;
+	 
+reg [31:0] RTC_timestampOut;
+reg [28:0] RTC_savedtimeOut;
+reg		   RTC_inuse;
+
+reg rtc_change;
+reg RTC_saveLoaded_1;
+reg RTC_timestampNew_1; 
+reg [31:0] diffSeconds;
+
+always_ff @(posedge clk_sys) begin
+	if(reset) begin
+		rtc_halt  <= 0;
+		RTC_inuse <= 0;
+	end else begin
+	
+		if (rtc_change == 1'b0) begin
+			RTC_savedtimeOut <= {rtc_halt, rtc_overflow, rtc_days, rtc_hours, rtc_minutes, rtc_seconds};
+		end
+	
+		rtc_change	  <= 1'b0;
+		rtc_subseconds <= rtc_subseconds + 1'd1;
+	
+		RTC_saveLoaded_1 <= RTC_saveLoaded;
+		if (RTC_saveLoaded_1 == 1'b0 && RTC_saveLoaded == 1'b1) begin  // loading from file
+			
+			if (RTC_timestampOut > RTC_timestampSaved) begin
+				diffSeconds <= RTC_timestampOut - RTC_timestampSaved;
+			end
+			
+			rtc_seconds	 <= RTC_savedtimeIn[5:0];
+			rtc_minutes	 <= RTC_savedtimeIn[11:6];
+			rtc_hours	 <= RTC_savedtimeIn[16:12];
+			rtc_days		 <= RTC_savedtimeIn[26:17];
+			rtc_overflow <= RTC_savedtimeIn[27];
+			rtc_halt		 <= RTC_savedtimeIn[28];
+		  
+		end else if(cart_wr && (cart_addr[15:13] == 3'b101) && mbc3_mode == 1'b1) begin // setting from ingame
+		
+			case (rtc_index)
+				0: rtc_seconds	<= cart_di[5:0]; 
+				1: rtc_minutes	<= cart_di[5:0]; 
+				2: rtc_hours	  <= cart_di[4:0]; 
+				3: rtc_days[7:0] <= cart_di; 
+				4: begin
+					rtc_days[8]  <= cart_di[0]; 
+					rtc_halt	  <= cart_di[6]; 
+					rtc_overflow <= cart_di[7];
+				end
+			endcase
+			
+		end else begin  // normal counting
+			
+			if (rtc_halt == 1'b0) begin
+				if (rtc_seconds >= 60)	 begin rtc_seconds <= 6'd0;  rtc_minutes  <= rtc_minutes + 1'd1; end
+				if (rtc_minutes >= 60)	 begin rtc_minutes <= 6'd0;  rtc_hours	   <= rtc_hours + 1'd1;	  end
+				if (rtc_hours	>= 24)	 begin rtc_hours	<= 5'd0;   rtc_days	   <= rtc_days + 1'd1;	  end
+				if (rtc_days	 >= 512)	 begin rtc_days	 <= 10'd0; rtc_overflow <= 1'b1;					  end
+			end
+			
+			if (rtc_subseconds >= 33554432) begin 
+				rtc_subseconds	  <= 26'd0; 
+				RTC_timestampOut	<= RTC_timestampOut + 1'd1;
+				if (rtc_halt == 1'b0) begin
+					rtc_seconds	  <= rtc_seconds + 1'd1;
+					rtc_change		<= 1'b1; 
+				end
+			end else if (diffSeconds > 0 && rtc_change == 1'b0) begin // fast counting loaded seconds
+				diffSeconds		  <= diffSeconds - 1'd1; 
+				if (rtc_halt == 1'b0) begin
+					rtc_seconds	  <= rtc_seconds + 1'd1;
+					rtc_change		<= 1'b1; 
+				end
+			end
+	
+		end
+		
+		RTC_timestampNew_1 <= RTC_timestampNew;
+		if (RTC_timestampNew != RTC_timestampNew_1) begin
+			RTC_timestampOut <= RTC_timestampIn;
+		end
+		
+	end
+end
+
+always_ff @(posedge clk_sys) begin
+	case (rtc_index)
+		0: rtc_return <= rtc_seconds; 
+		1: rtc_return <= rtc_minutes; 
+		2: rtc_return <= rtc_hours; 
+		3: rtc_return <= rtc_days[7:0];
+		4: rtc_return <= {rtc_overflow, rtc_halt, 5'b00000, rtc_days[8]};
+	endcase
+end
 
 /////////////////////////  BRAM SAVE/LOAD  /////////////////////////////
 
@@ -810,7 +923,7 @@ wire [7:0] cram_do =
 		((cart_addr[15:9] == 7'b1010000) && mbc2) ? 
 			{4'hF,cram_q[3:0]} : // 4 bit MBC2 Ram needs top half masked.
 			mbc3_mode ?
-				8'h0:            // RTC mode 
+				rtc_return:      // RTC mode 
 				cram_q :         // Return normal value
 		8'hFF;                   // Ram not enabled
 

@@ -52,9 +52,10 @@ module gb (
 	output [14:0] lcd_data,
 	output [1:0] lcd_mode,
 	output lcd_on,
+	output lcd_vsync,
 
-	output [5:0] joy_p54,
-	input  [5:0] joy_sgb,
+	output [1:0] joy_p54,
+	input  [3:0] joy_din,
 	
 	output speed,   //GBC
 	
@@ -64,7 +65,6 @@ module gb (
 	output         gg_available,
 
 	//serial port
-	input   serial_ena,
 	output sc_int_clock2,
 	input serial_clk_in,
 	output serial_clk_out,
@@ -90,10 +90,11 @@ wire sel_if   = cpu_addr == 16'hff0f;                // interupt flag
 wire sel_iram = (cpu_addr[15:14] == 2'b11) && (~&cpu_addr[13:9]); // 8k internal ram at $C000-DFFF. C000-DDFF mirrored to E000-FDFF
 wire sel_zpram = (cpu_addr[15:7] == 9'b111111111) && // 127 bytes zero pageram at $ff80
 					 (cpu_addr != 16'hffff);
-wire sel_audio = (cpu_addr[15:8] == 8'hff) &&        // audio reg ff10 - ff3f
-					((cpu_addr[7:5] == 3'b001) || (cpu_addr[7:4] == 4'b0001));
+wire sel_audio = (cpu_addr[15:8] == 8'hff) &&        // audio reg ff10 - ff3f and ff76/ff77 PCM12/PCM34 (undocumented registers)
+					((cpu_addr[7:5] == 3'b001) || (cpu_addr[7:4] == 4'b0001) || (cpu_addr[7:0] == 8'h76) || (cpu_addr[7:0] == 8'h77));
 					
-//DMA can select from $0000 to $F100					
+//DMA can select from $0000 to $F100	
+wire [15:0] dma_addr;				
 wire dma_sel_rom = !dma_addr[15];                       // lower 32k are rom
 wire dma_sel_cram = dma_addr[15:13] == 3'b101;           // 8k cart ram at $a000
 wire dma_sel_vram = dma_addr[15:13] == 3'b100;           // 8k video ram at $8000
@@ -108,16 +109,46 @@ wire sel_key1 = cpu_addr == 16'hff4d;  			      // KEY1 - CGB Mode Only - Prepar
 wire sel_rp = cpu_addr == 16'hff56; //FF56 - RP - CGB Mode Only - Infrared Communications Port
 
 //HDMA can select from $0000 to $7ff0 or A000-DFF0
+wire [15:0] hdma_source_addr;
 wire hdma_sel_rom = !hdma_source_addr[15];                  // lower 32k are rom
 wire hdma_sel_cram = hdma_source_addr[15:13] == 3'b101;     // 8k cart ram at $a000
 wire hdma_sel_iram = hdma_source_addr[15:13] == 3'b110;     // 8k internal ram at $c000-$dff0
 
 
 // the boot roms sees a special $42 flag in $ff50 if it's supposed to to a fast boot
+reg boot_rom_enabled;
 wire sel_fast = fast_boot && cpu_addr == 16'hff50 && boot_rom_enabled;
 
+wire sc_start;
+wire sc_shiftclock;
 wire [7:0] sc_r = {sc_start,6'h3F,sc_shiftclock};
+
+wire irq_ack;
+wire [7:0] irq_vec;
+reg [4:0] if_r;
+reg [4:0] ie_r; // writing  $ffff sets the irq enable mask
+wire irq_n;
 				
+reg [2:0] iram_bank; //1-7 FF70 - SVBK
+reg vram_bank; //0-1 FF4F - VBK
+
+wire [7:0] hdma_do;
+wire hdma_active;
+
+reg cpu_speed; // - 0 Normal mode (4MHz) - 1 Double Speed Mode (8MHz)
+reg prepare_switch; // set to 1 to toggle speed
+
+wire [7:0] joy_do;
+wire [7:0] sb_o;
+wire [7:0] timer_do;
+wire [7:0] video_do;
+wire [7:0] audio_do;
+wire [7:0] rom_do;
+wire [7:0] vram_do;
+wire [7:0] vram1_do;
+wire [7:0] zpram_do;
+wire [7:0] iram_do;
+            
 // http://gameboy.mongenel.com/dmg/asmmemmap.html
 wire [7:0] cpu_di = 
 		irq_ack?irq_vec:
@@ -129,7 +160,7 @@ wire [7:0] cpu_di =
 	   isGBC&&sel_hdma?{hdma_do}:  //hdma GBC
 	   isGBC&&sel_key1?{cpu_speed,6'h3f,prepare_switch}: //key1 cpu speed register(GBC)
 		sel_joy?joy_do:         // joystick register
-		sel_sb?sb:				// serial transfer data register
+		sel_sb?sb_o:				// serial transfer data register
 		sel_sc?sc_r:				// serial transfer control register
 		sel_timer?timer_do:     // timer registers
 		sel_video_reg?video_do: // video registers
@@ -155,13 +186,21 @@ wire ce_cpu = cpu_speed ? ce_2x:ce;
 wire clk_cpu = clk_sys & ce_cpu;
 
 wire cpu_clken = !(isGBC && hdma_active) && ce_cpu;  //when hdma is enabled stop CPU (GBC)
+reg reset_r = 1;
+
+//sync reset with clock
+always  @ (posedge clk) begin
+	reset_r <= reset;
+end
 
 
 wire cpu_stop;
 
+wire genie_ovr;
+wire [7:0] genie_data;
 	
 GBse cpu (
-	.RESET_n    ( !reset        ),
+	.RESET_n    ( !reset_r        ),
 	.CLK_n      ( clk_sys       ),
 	.CLKEN      ( cpu_clken     ),
 	.WAIT_n     ( 1'b1          ),
@@ -186,9 +225,6 @@ GBse cpu (
 // --------------------------- Cheat Engine ---------------------------
 // --------------------------------------------------------------------
 
-wire genie_ovr;
-wire [7:0] genie_data;
-
 CODES codes (
 	.clk        (clk_sys),
 	.reset      (gg_reset),
@@ -205,12 +241,10 @@ CODES codes (
 // --------------------------------------------------------------------
 // --------------------- Speed Toggle KEY1 (GBC)-----------------------
 // --------------------------------------------------------------------
-reg cpu_speed; // - 0 Normal mode (4MHz) - 1 Double Speed Mode (8MHz)
-reg prepare_switch; // set to 1 to toggle speed
 assign speed = cpu_speed;
 
 always @(posedge clk_sys) begin
-   if(reset) begin
+   if(reset_r) begin
 		cpu_speed <= 1'b0;
 		prepare_switch <= 1'b0;
 	end
@@ -230,16 +264,17 @@ end
 
 wire audio_rd = !cpu_rd_n && sel_audio;
 wire audio_wr = !cpu_wr_n && sel_audio;
-wire [7:0] audio_do;
 
 gbc_snd audio (
 	.clk				( clk_sys			),
 	.ce            ( ce_2x           ),
-	.reset			( reset				),
+	.reset			( reset_r			),
+	
+	.is_gbc        ( isGBC           ),
 
 	.s1_read  		( audio_rd  		),
 	.s1_write 		( audio_wr  		),
-	.s1_addr    	( cpu_addr[5:0]	),
+	.s1_addr    	( cpu_addr[6:0]	),
    .s1_readdata 	( audio_do        ),
 	.s1_writedata  ( cpu_do       	),
 
@@ -251,22 +286,14 @@ gbc_snd audio (
 // -----------------------serial port()--------------------------------
 // --------------------------------------------------------------------
 
-wire serial_irq    = serial_ena ? serial_irq_s    : serial_irq_f;
-wire [7:0] sb      = serial_ena ? sb_s            : 8'hFF;
-wire sc_start      = serial_ena ? sc_start_s      : sc_start_f;
-wire sc_shiftclock = serial_ena ? sc_shiftclock_s : sc_shiftclock_f;
-
 // SNAC
-wire serial_irq_s;
-wire [7:0] sb_s;
-wire sc_start_s;
-wire sc_shiftclock_s;
+wire serial_irq;
 
 assign sc_int_clock2 = sc_shiftclock;
 
 link link (
   .clk(clk_cpu),
-  .rst(reset),
+  .rst(reset_r),
 
   .sel_sc(sel_sc),
   .sel_sb(sel_sb),
@@ -281,65 +308,26 @@ link link (
 
   .serial_clk_out(serial_clk_out),
   .serial_data_out(serial_data_out),
-  .sb(sb_s),
-  .serial_irq(serial_irq_s),
-  .sc_start(sc_start_s),
-  .sc_int_clock(sc_shiftclock_s)
+  .sb(sb_o),
+  .serial_irq(serial_irq),
+  .sc_start(sc_start),
+  .sc_int_clock(sc_shiftclock)
 
 );
-
-// Fake
-reg sc_start_f,sc_shiftclock_f;
-reg serial_irq_f;
-
-always @(posedge clk_cpu) begin
-	reg [3:0] serial_counter;
-	reg [8:0] serial_clk_div; //8192Hz
-
-	serial_irq_f <= 1'b0;
-   if(reset) begin
-		  sc_start_f <= 1'b0;
-		  sc_shiftclock_f <= 1'b0;
-	end else if (sel_sc && !cpu_wr_n) begin	 //cpu write
-		sc_start_f <= cpu_do[7];
-		sc_shiftclock_f <= cpu_do[0];
-		if (cpu_do[7]) begin 						//enable transfer
-			serial_clk_div <= 9'h1FF;
-			serial_counter <= 4'd8;
-		end 
-	end else if (sc_start_f && sc_shiftclock_f) begin // serial transfer and serial clock enabled
-		
-		serial_clk_div <= serial_clk_div - 9'd1;
-		
-		if (serial_clk_div == 9'd0  && serial_counter)
-				serial_counter <= serial_counter - 4'd1;
-		
-		if (!serial_counter) begin
-			serial_irq_f <= 1'b1; 	//trigger interrupt
-			sc_start_f <= 1'b0; 	//reset transfer state
-			serial_clk_div <= 9'h1FF;
-		   serial_counter <= 4'd8;
-		end	
-	
-	end
-	
-end
 
 // --------------------------------------------------------------------
 // ------------------------------ inputs ------------------------------
 // --------------------------------------------------------------------
 
-wire [3:0] joy_p4 = ~{ joystick[2], joystick[3], joystick[1], joystick[0] } | {4{p54[0]}};
-wire [3:0] joy_p5 = ~{ joystick[7], joystick[6], joystick[5], joystick[4] } | {4{p54[1]}};
 reg  [1:0] p54;
 
 always @(posedge clk_cpu) begin
-	if(reset) p54 <= 2'b11;
+	if(reset_r) p54 <= 2'b11;
 	else if(sel_joy && !cpu_wr_n)	p54 <= cpu_do[5:4];
 end
 
-wire [7:0] joy_do = { 2'b11, joy_sgb };
-assign joy_p54 = {p54, joy_p4 & joy_p5};
+assign joy_do = { 2'b11, p54, joy_din };
+assign joy_p54 = p54;
 
 // --------------------------------------------------------------------
 // ---------------------------- interrupts ----------------------------
@@ -349,32 +337,32 @@ assign joy_p54 = {p54, joy_p4 & joy_p5};
 // the register to 1. The "highest" one active is cleared when the cpu
 // runs an interrupt ack cycle or when it writes a 0 to the register
 
-wire irq_ack = !cpu_iorq_n && !cpu_m1_n;
+assign irq_ack = !cpu_iorq_n && !cpu_m1_n;
 
 // irq vector
-wire [7:0] irq_vec = 
+assign irq_vec = 
 			if_r[0]&&ie_r[0]?8'h40:   // vsync
 			if_r[1]&&ie_r[1]?8'h48:   // lcdc
 			if_r[2]&&ie_r[2]?8'h50:   // timer
 			if_r[3]&&ie_r[3]?8'h58:   // serial
 			if_r[4]&&ie_r[4]?8'h60:   // input
-			8'h55;
+			8'h00;
 
 //wire vs = (lcd_mode == 2'b01);
 //reg vsD, vsD2;
-reg [7:0] inputD, inputD2;
+reg [3:0] inputD, inputD2;
 
 // irq is low when an enable irq is active
-wire irq_n = !(ie_r & if_r);
+assign irq_n = !(ie_r & if_r);
 
-reg [4:0] if_r;
-reg [4:0] ie_r; // writing  $ffff sets the irq enable mask
+wire video_irq,vblank_irq;
+wire timer_irq;
 
 reg old_vblank_irq, old_video_irq, old_timer_irq, old_serial_irq;
+reg old_ack = 0;
 always @(negedge clk_cpu) begin //negedge to trigger interrupt earlier
-	reg old_ack = 0;
-	
-	if(reset) begin
+
+	if(reset_r) begin
 		ie_r <= 5'h00;
 		if_r <= 5'h00;
 	end
@@ -397,7 +385,8 @@ always @(negedge clk_cpu) begin //negedge to trigger interrupt earlier
 	if(~old_serial_irq & serial_irq) if_r[3] <= 1'b1;
 
 	// falling edge on any input line P10..P13
-	inputD <= {joy_p4, joy_p5};
+
+	inputD <= joy_din;
 	inputD2 <= inputD;
 	if(~inputD & inputD2) if_r[4] <= 1'b1;
 
@@ -426,10 +415,8 @@ end
 // ------------------------------ timer -------------------------------
 // --------------------------------------------------------------------
 
-wire timer_irq;
-wire [7:0] timer_do;
 timer timer (
-	.reset	    ( reset         ),
+	.reset	    ( reset_r         ),
 	.clk		    ( clk_cpu       ), //2x in fast mode
 
 	.irq         ( timer_irq     ),
@@ -446,16 +433,13 @@ timer timer (
 // --------------------------------------------------------------------
 
 // cpu tries to read or write the lcd controller registers
-wire video_irq,vblank_irq;
-wire [7:0] video_do;
 wire [12:0] video_addr;
-wire [15:0] dma_addr;
 wire video_rd, dma_rd;
 wire [7:0] dma_data = dma_sel_iram?iram_do:dma_sel_vram?(isGBC&&vram_bank)?vram1_do:vram_do:cart_do;
 
 
 video video (
-	.reset       ( reset         ),
+	.reset       ( reset_r         ),
 	.clk         ( clk_sys       ),
 	.ce          ( ce            ),   // 4Mhz
 	.ce_cpu      ( ce_cpu        ),   //can be 2x in cgb double speed mode
@@ -477,7 +461,8 @@ video video (
 	.lcd_clkena  ( lcd_clkena    ),
 	.lcd_data    ( lcd_data      ),
 	.mode        ( lcd_mode      ),
-	
+	.lcd_vsync   ( lcd_vsync     ),
+
 	.vram_rd     ( video_rd      ),
 	.vram_addr   ( video_addr    ),
 	.vram_data   ( vram_do       ),
@@ -494,9 +479,8 @@ video video (
 // total 8k/16k (CGB) vram from $8000 to $9fff
 wire cpu_wr_vram = sel_vram && !cpu_wr_n && lcd_mode!=3;
 
-reg vram_bank; //0-1 FF4F - VBK
-
-wire [7:0] vram_do,vram1_do;
+wire hdma_rd;
+wire is_hdma_cart_addr;
 wire [7:0] vram_di = (hdma_rd&&isGBC)?
 								hdma_sel_iram?iram_do:
 								is_hdma_cart_addr?cart_do:
@@ -507,6 +491,7 @@ wire [7:0] vram_di = (hdma_rd&&isGBC)?
 wire vram_wren = video_rd?1'b0:!vram_bank&&((hdma_rd&&isGBC)||cpu_wr_vram);
 wire vram1_wren = video_rd?1'b0:vram_bank&&((hdma_rd&&isGBC)||cpu_wr_vram);
 
+wire [15:0] hdma_target_addr;
 wire [12:0] vram_addr = video_rd?video_addr:(hdma_rd&&isGBC)?hdma_target_addr[12:0]:(dma_rd&&dma_sel_vram)?dma_addr[12:0]:cpu_addr[12:0];
 
 
@@ -539,14 +524,8 @@ end
 // -------------------------- HDMA engine(GBC) ------------------------
 // --------------------------------------------------------------------
 
-wire [15:0] hdma_source_addr;
-wire [15:0] hdma_target_addr;
-wire [7:0] hdma_do;
-wire hdma_rd;
-wire hdma_active;
-
 hdma hdma(
-	.reset	          ( reset         ),
+	.reset	          ( reset_r         ),
 	.clk		          ( clk_sys       ),
 	.ce                ( ce_cpu         ),
 	.speed				 ( cpu_speed     ),
@@ -574,7 +553,6 @@ hdma hdma(
 
 // 127 bytes internal zero page ram from $ff80 to $fffe
 wire cpu_wr_zpram = sel_zpram && !cpu_wr_n;
-wire [7:0] zpram_do;
 spram #(7) zpram (
 	.clock      ( clk_cpu        ),
 	.address    ( cpu_addr[6:0]  ),
@@ -587,7 +565,7 @@ spram #(7) zpram (
 // ------------------------ 8k/32k(GBC) internal ram  -----------------
 // --------------------------------------------------------------------
 
-reg  [2:0] iram_bank; //1-7 FF70 - SVBK
+wire cpu_wr_iram = sel_iram && !cpu_wr_n;
 wire iram_wren = (dma_rd&&dma_sel_iram)||(isGBC&&hdma_rd&&hdma_sel_iram)?1'b0:cpu_wr_iram;
 
 wire [14:0] iram_addr = (isGBC&&hdma_rd&&hdma_sel_iram)?               //hdma transfer?
@@ -601,8 +579,6 @@ wire [14:0] iram_addr = (isGBC&&hdma_rd&&hdma_sel_iram)?               //hdma tr
 								{3'd0,cpu_addr[11:0]};						  		  //bank 0				
 								
 
-wire cpu_wr_iram = sel_iram && !cpu_wr_n;
-wire [7:0] iram_do;
 spram #(15) iram (
 	.clock      ( clk_cpu        ),
 	.address    ( iram_addr      ),
@@ -613,7 +589,7 @@ spram #(15) iram (
 
 //GBC WRAM banking
 always @(posedge clk_cpu) begin
-	if(reset)
+	if(reset_r)
 		iram_bank <= 3'd1;
 	else if((cpu_addr == 16'hff70) && !cpu_wr_n && isGBC) begin
 		if (cpu_do[2:0]==3'd0) // 0 -> 1;
@@ -628,9 +604,8 @@ end
 // --------------------------------------------------------------------
 
 // writing 01(GB) or 11(GBC) to $ff50 disables the internal rom
-reg boot_rom_enabled;
 always @(posedge clk) begin
-	if(reset)
+	if(reset_r)
 		boot_rom_enabled <= 1'b1;
 	else if((cpu_addr == 16'hff50) && !cpu_wr_n)
           if ((isGBC && cpu_do[7:0]==8'h11) || (!isGBC && cpu_do[0]))
@@ -639,7 +614,10 @@ end
 			
 // combine boot rom data with cartridge data
 
-wire [7:0] rom_do = isGBC? //GameBoy Color?
+wire [7:0] boot_rom_do;
+wire [7:0] fast_boot_rom_do;
+
+assign rom_do = isGBC? //GameBoy Color?
                         (((cpu_addr[14:8] == 7'h00) || (hdma_rd&& hdma_source_addr[14:8] == 7'h00))&& boot_rom_enabled)?gbc_bios_do:         //0-FF bootrom 1st part
                         ((cpu_addr[14:9] == 6'h00) || (hdma_rd&& hdma_source_addr[14:9] == 6'h00))? cart_do:                                 //100-1FF Cart Header
                         (((cpu_addr[14:12] == 3'h0) || (hdma_rd&& hdma_source_addr[14:12] == 3'h0)) && boot_rom_enabled)?gbc_bios_do:        //200-8FF bootrom 2nd part
@@ -648,7 +626,7 @@ wire [7:0] rom_do = isGBC? //GameBoy Color?
 
 
 wire is_dma_cart_addr = (dma_sel_rom || dma_sel_cram); //rom or external ram
-wire is_hdma_cart_addr = (hdma_sel_rom || hdma_sel_cram); //rom or external ram
+assign is_hdma_cart_addr = (hdma_sel_rom || hdma_sel_cram); //rom or external ram
 
 assign cart_di = cpu_do;
 assign cart_addr = (isGBC&&hdma_rd&&is_hdma_cart_addr)?hdma_source_addr:(dma_rd&&is_dma_cart_addr)?dma_addr:cpu_addr;
@@ -657,14 +635,12 @@ assign cart_wr = (sel_rom || sel_cram) && !cpu_wr_n && !hdma_rd;
 
 assign gbc_bios_addr = hdma_rd?hdma_source_addr[11:0]:cpu_addr[11:0];
 
-wire [7:0] boot_rom_do;
 boot_rom boot_rom (
 	.addr    ( cpu_addr[7:0] ),
 	.clk     ( clk_sys       ),
 	.data    ( boot_rom_do   )
 );
 
-wire [7:0] fast_boot_rom_do;
 fast_boot_rom fast_boot_rom (
 	.addr    ( cpu_addr[7:0] ),
 	.clk     ( clk_sys       ),

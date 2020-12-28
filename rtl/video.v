@@ -39,6 +39,7 @@ module video (
 	output lcd_on,
 	output lcd_clkena,
 	output [14:0] lcd_data,
+	output lcd_vsync,
 
 	output irq,
 	output vblank_irq,
@@ -66,45 +67,18 @@ wire [7:0] sprite_attr;
 wire [3:0] sprite_index;
 
 wire oam_eval_end;
-sprites sprites (
-	.clk      ( clk          ),
-	.ce       ( ce           ),
-	.ce_cpu   ( ce_cpu       ),
-	.size16   ( lcdc_spr_siz ),
-	.isGBC_game ( isGBC&&isGBC_game ),
 
-	.lcd_on   ( lcd_on       ),
-
-	.v_cnt    ( v_cnt        ),
-	.h_cnt    ( pcnt        ),
-
-	.oam_eval  ( oam ),
-	.oam_fetch ( mode3 ),
-	.oam_eval_reset ( end_of_line & ~vblank ),
-	.oam_eval_end ( oam_eval_end ),
-
-	.sprite_fetch (sprite_found),
-	.sprite_addr ( sprite_addr                 ),
-	.sprite_attr ( sprite_attr ),
-	.sprite_index ( sprite_index ),
-	.sprite_fetch_done ( sprite_fetch_done) ,
-
-	.dma_active ( dma_active),
-	.oam_wr     ( oam_wr       ),
-	.oam_addr_in( oam_addr     ),
-	.oam_di     ( oam_di       ),
-	.oam_do     ( oam_do       )
-);
+reg dma_active;
+reg [7:0] dma;
+reg [9:0] dma_cnt;     // dma runs 4*160 clock cycles = 160us @ 4MHz
 
 // give dma access to oam
 wire [7:0] oam_addr = dma_active?dma_addr[7:0]:cpu_addr;
 wire oam_wr = dma_active?(dma_cnt[1:0] == 2):(cpu_wr && cpu_sel_oam && !(mode==3 || mode==2));
 wire [7:0] oam_di = dma_active?dma_data:cpu_di;
 
-
-assign lcd_on = lcdc_on;
-
 // $ff40 LCDC
+reg [7:0] lcdc;
 wire lcdc_on = lcdc[7];
 wire lcdc_win_tile_map_sel = lcdc[6];
 wire lcdc_win_ena = lcdc[5];
@@ -119,7 +93,7 @@ wire lcdc_spr_ena = lcdc[1];
 wire lcdc_bg_ena = lcdc[0] | (isGBC&&isGBC_game);
 wire lcdc_bg_prio = lcdc[0];
 
-reg [7:0] lcdc;
+assign lcd_on = lcdc_on;
 
 // ff41 STAT
 reg [7:0] stat;
@@ -129,22 +103,20 @@ reg [7:0] scy;
 reg [7:0] scx;
 
 // ff44 line counter
+reg [8:0] h_cnt;            // max 455
+reg [7:0] v_cnt;            // max 153
 wire [7:0] ly = v_cnt;
 
 // ff45 line counter compare
-wire lyc_match = (ly == lyc);
 reg [7:0] lyc;
+wire lyc_match = (ly == lyc);
 
 reg [7:0] bgp;
 reg [7:0] obp0;
 reg [7:0] obp1;
 
 reg [7:0] wy;
-reg [7:0] wy_r;   // stable over line
-
 reg [7:0] wx;
-reg [7:0] wx_r;   // stable over line
-
 
 //ff68-ff6A GBC
 //FF68 - BCPS/BGPI  - Background Palette Index
@@ -168,9 +140,6 @@ reg[7:0] obpd [63:0]; //64 bytes
 assign dma_addr = { dma, dma_cnt[9:2] };
 assign dma_rd = dma_active;
 
-reg dma_active;
-reg [7:0] dma;
-reg [9:0] dma_cnt;     // dma runs 4*160 clock cycles = 160us @ 4MHz
 always @(posedge clk) begin
 	if(reset)
 		dma_active <= 1'b0;
@@ -200,11 +169,13 @@ end
 wire h455 = (h_cnt == 9'd455);
 wire vblank  = (v_cnt >= 144);
 
-reg vblank_l, end_of_line, lyc_match_l;
+reg vblank_l, end_of_line, end_of_line_l, end_of_line_ll, lyc_match_l;
 always @(posedge clk) begin
 	if (!lcd_on) begin
 		vblank_l <= 1'b0;
 		end_of_line <= 1'b0;
+		end_of_line_l <= 1'b0;
+		end_of_line_ll <= 1'b0;
 	end else if (ce) begin
 		if (h455) end_of_line <= 1'b1;
 		else if (end_of_line) begin
@@ -219,6 +190,9 @@ always @(posedge clk) begin
 				end_of_line <= 1'b0;
 			end
 		end
+
+		end_of_line_l <= end_of_line;
+		end_of_line_ll <= end_of_line_l;
 	end
 end
 
@@ -226,19 +200,21 @@ always @(posedge clk) begin
 	if (reset) begin
 		lyc_match_l <= 1'b0; // lyc_match does not reset when lcd is off
 	end else if (ce) begin
-		if (h_cnt[1:0] == 2'b10) begin
+		if (h_cnt[1:0] == 2'b11) begin
 			lyc_match_l <= lyc_match;
 		end
 	end
 end
 
-wire mode3_end = ~sprite_found & (pcnt == 8'd167);
+wire pcnt_end;
+wire mode3_end = isGBC ? pcnt_end : (~sprite_found & pcnt_end);
+
 reg mode3_end_l;
 always @(posedge clk) begin
 	if (!lcd_on) begin
 		mode3_end_l <= 1'b0;
 	end else if (ce) begin
-		if (end_of_line & ~vblank)
+		if (pcnt_reset)
 			mode3_end_l <= 1'b0;
 		else
 			mode3_end_l <= mode3_end;
@@ -246,7 +222,7 @@ always @(posedge clk) begin
 end
 
 wire int_lyc = (stat[6] & lyc_match_l);
-wire int_oam = (stat[5] & end_of_line & ~vblank_l);
+wire int_oam = (stat[5] & end_of_line_ll & ~vblank_l);
 wire int_vbl = (stat[4] & vblank_l);
 wire int_hbl = (stat[3] & mode3_end & ~vblank_l);
 
@@ -257,8 +233,8 @@ assign vblank_irq = vblank_l;
 // OAM evaluation starts at cycle 4.
 // Except on the first line when the LCD is enabled after being disabled
 // where it starts at cycle 0.
-wire oam     = lcd_on & ~end_of_line & ~oam_eval_end;
-wire mode3   = lcd_on & ~mode3_end_l & oam_eval_end;
+wire oam     = lcd_on & ~oam_eval_end;
+wire mode3   = lcd_on & (isGBC ? ~mode3_end : ~mode3_end_l) & oam_eval_end;
 
 assign mode = 
 	vblank_l ? 2'b01 :
@@ -364,8 +340,11 @@ assign cpu_do =
 reg skip_en;
 reg [7:0] skip;
 reg [7:0] pcnt;
-reg [9:0] bg_tile_map_addr;
+wire sprite_fetch_hold;
+wire bg_shift_empty;
 
+assign pcnt_end = ( pcnt == (isGBC ? 8'd168 : 8'd167) );
+wire pcnt_reset = (h_cnt[1:0] == 2'b11) & end_of_line & ~vblank;
 always @(posedge clk) begin
 	if (!lcd_on) begin
 		skip_en <= 1'b0;
@@ -387,103 +366,108 @@ always @(posedge clk) begin
 
 			// Pixels 0-7 are for fetching partially offscreen sprites and window.
 			// Pixels 8-167 are output to the display.
-			if(~skip_en && pcnt != 8'd167)
+			if(~skip_en & ~pcnt_end)
 				pcnt <= pcnt + 1'd1;
 
 		end
 
-		if (end_of_line & ~vblank) begin
+		if (pcnt_reset) begin
 			pcnt <= 8'd0;
 		end
 	end
 end
-
-reg [8:0] h_cnt;            // max 455
-reg [7:0] v_cnt;            // max 153
-reg [7:0] win_line;
-reg [2:0] tile_line;
-
-// line inside the background currently being drawn
-wire [7:0] bg_line = v_cnt + scy;
-
-// TODO: Fix window_x = A6. Hblank starts when it should be waiting for the window fetching to end
-wire win_start = lcdc_win_ena && ~sprite_fetch_hold && ~skip_en && ~bg_shift_empty && (v_cnt >= wy_r) && (pcnt == wx_r) && (wx_r < 8'hA6);
-reg window_ena;
 
 // vcnt_reset goes high a few cycles after v_cnt is incremented to 153.
 // It resets v_cnt back to 0 and keeps it in reset until the following line.
 // This results in v_cnt 0 lasting for almost 2 lines.
 wire line153 = (v_cnt == 8'd153);
 reg vcnt_reset;
+reg vsync;
 always @(posedge clk) begin
 	if (!lcdc_on) begin
 		v_cnt <= 8'd0;
-		win_line <= 8'd0;
 		vcnt_reset <= 1'b0;
+		vsync <= 1'b0;
 	end else if (ce) begin
-		if (~vcnt_reset && h_cnt == 9'd455) begin
+		if (~vcnt_reset && h455) begin
 			v_cnt <= v_cnt + 1'b1;
-			if (window_ena) win_line <= win_line + 1'b1;
 		end
 
 		if (end_of_line && &h_cnt[1:0]) begin
 			vcnt_reset <= line153;
 			if (line153) begin
 				v_cnt <= 8'd0;
-				win_line <= 8'd0;
 			end
 		end
+
+		// VSync goes high on line 0 but it takes a full frame after the LCD is enabled
+		// because the first line where end_of_line is high after LCD is enabled is line 1.
+		if (end_of_line) vsync <= !v_cnt;
 	end
 end
 
-localparam DISPLAY_START = 4+80;
+assign lcd_vsync = vsync;
+
+// line inside the background currently being drawn
+wire [7:0] bg_line = v_cnt + scy;
+wire [7:0] bg_col  = pcnt + scx;
+wire [9:0] bg_map_addr = {bg_line[7:3], bg_col[7:3]};
+
+reg  [4:0] win_col;
+reg [7:0] win_line;
+wire window_ena;
+wire bg_fetch_done;
+wire bg_reload_shift;
+
+wire [9:0] win_map_addr = {win_line[7:3], win_col[4:0]};
+
+wire [9:0] bg_tile_map_addr = window_ena ? win_map_addr : bg_map_addr;
+
+wire [2:0] tile_line = window_ena ? win_line[2:0] : bg_line[2:0];
+
+reg window_match, window_ena_d;
+
+wire win_start = mode3 && lcdc_win_ena && ~sprite_fetch_hold && ~skip_en && ~bg_shift_empty && (v_cnt >= wy) && (pcnt == wx) && (wx < 8'hA7);
+assign window_ena = window_match & ~pcnt_reset & lcdc_win_ena;
 
 always @(posedge clk) begin
 
 	if (!lcdc_on) begin
 		//reset counters
 		h_cnt <= 9'd0;
-		window_ena <= 1'b0;
+		window_match <= 1'b0;
+		window_ena_d <= 1'b0;
+		win_col <= 5'd0;
+		win_line <= 8'd0;
 	end else if (ce) begin
+		h_cnt <= h455 ? 9'd0 : h_cnt + 9'd1;
 
-		if(h_cnt != 455) begin
-			h_cnt <= h_cnt + 9'd1;
-
-			// make sure signals don't change during the line
-			// latch at latest possible moment (one clock before display starts)
-			if(h_cnt == DISPLAY_START-1) begin
-				// set tile map address for this line
-				bg_tile_map_addr[9:5] <= bg_line[7:3];
-				bg_tile_map_addr[4:0] <= scx[7:3];
-				tile_line <= bg_line[2:0];
-				wx_r <= wx;
-				wy_r <= wy;
-			end
-
-			// Increment address when fetching is done and not waiting for sprites.
-			// The first bg tile fetch is only used for starting the tile shifter to find
-			// partially offscreen sprites and window so the second fetch starts at the
-			// same address so don't increment when pcnt = 0.
-			if(~sprite_fetch_hold && bg_fetch_done && bg_reload_shift && |pcnt)
-				bg_tile_map_addr[4:0] <= bg_tile_map_addr[4:0] + 1'd1;
-
-			if(win_start) begin
-				bg_tile_map_addr[9:5] <= win_line[7:3];
-				bg_tile_map_addr[4:0] <= 5'd0;           // window always start with its very left
-				tile_line <= win_line[2:0];
-				window_ena <= 1'b1;
-			end
-
-		end else begin
-			window_ena <= 1'b0;   // next line starts with background
-
-			// end of line reached
-			h_cnt <= 9'd0;
-
+		if(win_start) begin
+			window_match <= 1'b1;
 		end
+
+		window_ena_d <= window_ena;
+		if (vblank_l)
+			win_line <= 8'd0;
+		else if (window_ena_d & ~window_ena)
+			win_line <= win_line + 1'b1;
+
+		if (window_match & ~mode3_end_l & mode3_end) begin
+			// DMG glitch: If WX = A6 then window_match stays high through VBlank
+			// until WY > v_cnt which means the window always appears on line 0.
+			if (isGBC || wx != 8'hA6 || wy > v_cnt) begin
+				window_match <= 1'b0;   // next line starts with background
+			end
+		end
+
+		// Increment when fetching is done and not waiting for sprites.
+		if(window_ena && ~sprite_fetch_hold && bg_fetch_done && bg_reload_shift)
+			win_col <= win_col + 1'b1;
+
+		if (~lcdc_win_ena | pcnt_reset) win_col <= 5'd0;
+
 	end
 end
-
 
 // --------------------------------------------------------------------
 // ------------------- bg, window and sprite fetch  -------------------
@@ -524,15 +508,15 @@ wire [7:0] bg_vram_data_in = (isGBC & isGBC_game & bg_tile_attr_new[5]) ? bit_re
 reg [2:0] bg_fetch_cycle;
 reg [2:0] sprite_fetch_cycle;
 
-wire bg_fetch_done = (bg_fetch_cycle >= 3'd5);
+assign bg_fetch_done = (bg_fetch_cycle >= 3'd5);
 wire sprite_fetch_done = (sprite_fetch_hold && sprite_fetch_cycle >= 3'd5);
 
 // The first B01 cycle does not fetch sprites so wait until the bg shift register is not empty
-wire sprite_fetch_hold = sprite_found & ~bg_shift_empty;
+assign sprite_fetch_hold = sprite_found & ~bg_shift_empty;
 
 reg [3:0] bg_shift_cnt;
-wire bg_shift_empty = (bg_shift_cnt == 0);
-wire bg_reload_shift = (bg_shift_cnt <= 1);
+assign bg_shift_empty = (bg_shift_cnt == 0);
+assign bg_reload_shift = (bg_shift_cnt <= 1);
 
 wire spr_prio          = sprite_attr[7];
 wire spr_attr_h_flip   = sprite_attr[5];
@@ -558,6 +542,13 @@ wire [7:0] spr_cgb_index_prio = spr_cgb_prio(spr_cgb_index_shift[3], spr_cgb_ind
 // DMG sprite pixels are only loaded into the shift register if the old pixel is transparent.
 // CGB will mask the old pixel to 0 if the new pixel has higher priority.
 wire [7:0] spr_tile_mask = (spr_tile_shift_0 | spr_tile_shift_1) & ((isGBC & isGBC_game) ? ~spr_cgb_index_prio : 8'hFF);
+
+// cycle through the B01s states
+wire bg_tile_map_rd = (mode3 && bg_fetch_cycle[2:1] == 2'b00);
+wire bg_tile_data0_rd = (mode3 && bg_fetch_cycle[2:1] == 2'b01);
+wire bg_tile_data1_rd = (mode3 && bg_fetch_cycle[2:1] == 2'b10);
+wire bg_tile_obj0_rd = (mode3 && sprite_fetch_cycle[2:1] == 2'b01);
+wire bg_tile_obj1_rd = (mode3 && sprite_fetch_cycle[2:1] == 2'b10);
 
 always @(posedge clk) begin
 
@@ -638,7 +629,9 @@ always @(posedge clk) begin
 		if (~sprite_fetch_hold || sprite_fetch_done) sprite_fetch_cycle <= 0;
 
 		// Window start, reset fetching
-		if (win_start || !mode3) begin
+		// DMG glitch: fetching is not reset if WX = A6. The following lines all show
+		// the window from the start of the line.
+		if ( (win_start && (isGBC || wx != 8'hA6)) || !mode3) begin
 			bg_fetch_cycle <= 0;
 			bg_shift_cnt <= 0;
 		end
@@ -646,13 +639,6 @@ always @(posedge clk) begin
 	end
 
 end
-
-// cycle through the B01s states
-wire bg_tile_map_rd = (mode3 && bg_fetch_cycle[2:1] == 2'b00);
-wire bg_tile_data0_rd = (mode3 && bg_fetch_cycle[2:1] == 2'b01);
-wire bg_tile_data1_rd = (mode3 && bg_fetch_cycle[2:1] == 2'b10);
-wire bg_tile_obj0_rd = (mode3 && sprite_fetch_cycle[2:1] == 2'b01);
-wire bg_tile_obj1_rd = (mode3 && sprite_fetch_cycle[2:1] == 2'b10);
 
 assign vram_rd = lcdc_on && (bg_tile_map_rd || bg_tile_data0_rd ||
 										bg_tile_data1_rd || bg_tile_obj0_rd || bg_tile_obj1_rd);
@@ -671,6 +657,36 @@ assign vram_addr =
 	bg_tile_obj0_rd ? {1'b0, sprite_addr, 1'b0} :
 		{1'b0, sprite_addr, 1'b1};
 
+sprites sprites (
+	.clk      ( clk          ),
+	.ce       ( ce           ),
+	.ce_cpu   ( ce_cpu       ),
+	.size16   ( lcdc_spr_siz ),
+	.isGBC    ( isGBC        ),
+	.sprite_en( lcdc_spr_ena ),
+	.lcd_on   ( lcd_on       ),
+
+	.v_cnt    ( v_cnt        ),
+	.h_cnt    ( pcnt        ),
+
+	.oam_eval  ( oam ),
+	.oam_fetch ( mode3 ),
+	.oam_eval_reset ( pcnt_reset ),
+	.oam_eval_end ( oam_eval_end ),
+
+	.sprite_fetch (sprite_found),
+	.sprite_addr ( sprite_addr                 ),
+	.sprite_attr ( sprite_attr ),
+	.sprite_index ( sprite_index ),
+	.sprite_fetch_done ( sprite_fetch_done) ,
+
+	.dma_active ( dma_active),
+	.oam_wr     ( oam_wr       ),
+	.oam_addr_in( oam_addr     ),
+	.oam_di     ( oam_di       ),
+	.oam_do     ( oam_do       )
+);
+
 // --------------------------------------------------------------------
 // ----------------------- lcd output stage   -------------------------
 // --------------------------------------------------------------------
@@ -683,6 +699,8 @@ reg sprite_pixel_visible;
 
 wire [1:0] sprite_pixel_data = {spr_tile_shift_1[7], spr_tile_shift_0[7]};
 wire sprite_pixel_prio = spr_prio_shift[7];
+
+wire [1:0] bg_pix_data = { tile_shift_1[7], tile_shift_0[7] };
 
 always @(*) begin
 	sprite_pixel_visible = 1'b0;
@@ -713,8 +731,6 @@ always @(*) begin
 
 end
 
-wire [1:0] bg_pix_data = { tile_shift_1[7], tile_shift_0[7] };
-
 // If lcdc_bg_ena is off in Non-GBC mode then both background and window are blank. (BG color 0)
 wire [1:0] bgp_data = (!lcdc_bg_ena || bg_pix_data == 2'b00) ? bgp[1:0] :
 									  (bg_pix_data == 2'b01) ? bgp[3:2] :
@@ -743,7 +759,6 @@ wire [5:0] sprite_palette_index = isGBC_game? {spr_cgb_pal_out, sprite_pixel_dat
 wire [14:0] sprite_pix = isGBC ? {obpd[sprite_palette_index+1][6:0],obpd[sprite_palette_index]} : //gbc
 							{13'd0,obp_data};
 
-//wire lcd_clk = !vblank && ~skip_en && ~sprite_fetch_hold && ~bg_shift_empty && (pcnt >= 8);
 wire lcd_clk = mode3 && ~skip_en && ~sprite_fetch_hold && ~bg_shift_empty && (pcnt >= 8);
 
 reg [14:0] lcd_data_out;
@@ -754,6 +769,9 @@ always @(posedge clk) begin
 		if (lcd_clk) begin
 			lcd_data_out <= (sprite_pixel_visible) ? sprite_pix : pix_rgb_data;
 		end
+
+		// Output blank pixels if lcd is off.
+		if (~lcd_on) lcd_data_out <= isGBC ? 15'h7FFF : 15'd0;
 	end
 end
 

@@ -13,12 +13,18 @@ module sgb (
 	input [14:0] lcd_data,
 	input [1:0]  lcd_mode,
 	input        lcd_on,
+	input        lcd_vsync,
 
 	input [8:0]  h_cnt,
 	input [8:0]  v_cnt,
 
-	input [5:0]  joy_di,
-	output [5:0] joy_do,
+	input [7:0]  joystick_0,
+	input [7:0]  joystick_1,
+	input [7:0]  joystick_2,
+	input [7:0]  joystick_3,
+
+	input [1:0]  joy_p54,
+	output [3:0] joy_do,
 
 	output reg [15:0] sgb_border_pix,
 
@@ -26,7 +32,8 @@ module sgb (
 	output reg [14:0] sgb_lcd_data,
 	output reg        sgb_lcd_clkena,
 	output reg [1:0]  sgb_lcd_mode,
-	output reg        sgb_lcd_on
+	output reg        sgb_lcd_on,
+	output reg        sgb_lcd_vsync
 );
 
 localparam CMD_PAL01    = 5'h00;
@@ -46,10 +53,10 @@ localparam CMD_ATTR_TRN = 5'h15;
 localparam CMD_ATTR_SET = 5'h16;
 localparam CMD_MASK_EN  = 5'h17;
 
-assign joy_do = joypad_id_out ? {joy_di[5:4],2'b11,joypad_id} : joy_di;
 
-wire p14 = joy_di[4];
-wire p15 = joy_di[5];
+
+wire p14 = joy_p54[0];
+wire p15 = joy_p54[1];
 
 reg old_p15, old_p14;
 reg [7:0] data;
@@ -107,14 +114,14 @@ always @(posedge clk_sys) begin
 		old_p15 <= p15;
 		old_p14 <= p14;
 
-		if (old_p15 & old_p14 & sgb_en) begin
+		if (sgb_en) begin
 
 			// Reset pulse
 			if (~p15 & ~p14) begin
 				{cnt, byte_cnt, packet_end} <= 0;
 			end
 
-			if (p15 ^ p14) begin
+			if ( old_p15 & old_p14 & (p15 ^ p14) ) begin
 				if (~packet_end) begin
 					data <= {~p15,data[7:1]};
 					cnt <= cnt + 1'b1;
@@ -122,6 +129,10 @@ always @(posedge clk_sys) begin
 				end
 			end
 
+			// Corrupt packet. p15 and p14 should both go high after one is low.
+			if ( (old_p15 ^ p15) & (old_p15 ^ old_p14) & (p15 ^ p14) ) begin
+				packet_end <= 1'b1;
+			end
 		end
 
 		trn_start <= 0;
@@ -191,6 +202,7 @@ always @(posedge clk_sys) begin
 						{CMD_PAL23,4'd9},
 						{CMD_PAL03,4'd9}: pal0123_no <= 2'd3;
 					endcase
+
 				end
 				CMD_PAL_SET:
 					case (byte_cnt)
@@ -330,6 +342,7 @@ end
   2 player: 0F,0E. 4 player: 0F,0E,0D,0C
   Normal Gameboy or Super Gameboy with multiplayer disabled will always return 0F.
 */
+
 reg [1:0] joypad_id;
 reg joypad_id_out;
 reg joylock;
@@ -357,6 +370,19 @@ always @(posedge clk_sys) begin
 
 end
 
+assign joy_do = joypad_id_out ? {2'b11,joypad_id} : joy_data;
+
+wire [3:0] joy_dir     = ~{ joystick[2], joystick[3], joystick[1], joystick[0] } | {4{p14}};
+wire [3:0] joy_buttons = ~{ joystick[7], joystick[6], joystick[5], joystick[4] } | {4{p15}};
+wire [3:0] joy_data = joy_dir & joy_buttons;
+
+wire [7:0] joystick =
+				(~sgb_en | ~mlt_ctrl[0]) ? (joystick_0 | joystick_1) :
+				(joypad_id == 2'b11) ? joystick_0 :
+				(joypad_id == 2'b10) ? joystick_1 :
+				(joypad_id == 2'b01) ? joystick_2 :
+				                       joystick_3;
+
 wire lcd_off = !lcd_on || (lcd_mode == 2'd01);
 reg old_lcd_off;
 
@@ -366,6 +392,7 @@ reg [7:0] pix_x, pix_y;
 reg [8:0] tile_offset;
 reg [6:0] trn_data_h, trn_data_l;
 reg output_border = 0;
+reg pct_trn_done, chr_trn_done;
 
 wire [8:0] tile_number = {tile_offset+pix_x[7:3]};
 
@@ -378,7 +405,10 @@ wire [15:0] trn_data = {trn_data_h,lcd_data[1],trn_data_l,lcd_data[0]};
 
 
 always @(posedge clk_sys) begin
-	if (ce) begin
+	if (reset) begin
+		pct_trn_done <= 0;
+		chr_trn_done <= 0;
+	end else if (ce) begin
 		frame_end <= 0;
 
 		old_lcd_off <= lcd_off;
@@ -406,7 +436,10 @@ always @(posedge clk_sys) begin
 
 			if (pix_x == 8'd159 && pix_y == 8'd103) begin // 256 tiles
 				trn_en <= 0;
-				if (trn_en && cmd == CMD_PCT_TRN) output_border <= 1'b1;
+				if (trn_en) begin
+					if (cmd == CMD_PCT_TRN) pct_trn_done <= 1'b1;
+					if (cmd == CMD_CHR_TRN) chr_trn_done <= 1'b1;
+				end
 			end
 		end
 
@@ -417,10 +450,15 @@ always @(posedge clk_sys) begin
 			trn_wait <= 0;
 			if (trn_wait) begin
 				trn_en <= 1'b1;
-				if (cmd == CMD_CHR_TRN) output_border <= 0;
+				if (cmd == CMD_CHR_TRN || cmd == CMD_PCT_TRN) output_border <= 0;
 			end
 		end
 
+		if (pct_trn_done & chr_trn_done & !mask_en) begin
+			pct_trn_done <= 0;
+			chr_trn_done <= 0;
+			output_border <= 1'b1;
+		end
 	end
 
 end
@@ -464,7 +502,7 @@ dpram_dif #(15,2, 14,4) tile_ram (
 	.clock    ( clk_vid ),
 
 	.address_a  ( {char_trn_tile,tile_addr} ),
-	.wren_a     ( lcd_clkena && trn_en && cmd == CMD_CHR_TRN),
+	.wren_a     ( lcd_clkena && trn_en && cmd == CMD_CHR_TRN && !tile_number[8] ),
 	.data_a     ( lcd_data ),
 	.q_a        (),
 
@@ -501,6 +539,7 @@ always @(posedge clk_sys) begin
 			pal_set_wait <= 0;
 			pal_set_busy <= 1'b1;
 			pal_set_cnt <= 0;
+			pal_set_cnt_r <= 0;
 		end
 
 		sys_pal_data <= sys_pal_ram[{sys_pal_no[pal_set_cnt[3:2]], pal_set_cnt[1:0]}];
@@ -564,7 +603,7 @@ reg [4:0] attr_tile_cnt_x, attr_tile_cnt_y;
 reg [1:0] attr_file_pal_wr;
 reg attr_file_wr;
 
-reg [1:0] attr_chr_pal_cnt;
+reg [8:0] attr_chr_pal_cnt;
 reg [4:0] attr_chr_x;
 reg [8:0] attr_chr_offset;
 
@@ -706,8 +745,8 @@ always @(posedge clk_sys) begin
 		// ATTR_CHR
 		if (attr_chr_set) begin
 			attr_chr_busy <= 1'b1;
-			attr_chr_pal_cnt <= 0;
 			if (attr_chr_start) begin
+				attr_chr_pal_cnt <= 0;
 				attr_chr_x <= attr_chr_data_x;
 				attr_chr_offset <= attr_chr_data_offset;
 			end
@@ -715,7 +754,7 @@ always @(posedge clk_sys) begin
 
 		if (attr_chr_busy) begin
 			attr_chr_pal_cnt <= attr_chr_pal_cnt + 1'b1;
-			if (&attr_chr_pal_cnt || data_set_cnt+attr_chr_pal_cnt == data_set_len) attr_chr_busy <= 0;
+			if (&attr_chr_pal_cnt[1:0] || attr_chr_pal_cnt+1'b1 == attr_chr_len) attr_chr_busy <= 0;
 
 			if (attr_chr_dir) begin
 				attr_chr_offset <= attr_chr_offset + 9'd20;
@@ -736,7 +775,7 @@ always @(posedge clk_sys) begin
 			end
 
 			attr_tile_no_wr <= attr_chr_offset + attr_chr_x;
-			case (attr_chr_pal_cnt)
+			case (attr_chr_pal_cnt[1:0])
 				0: attr_file_pal_wr <= attr_chr_data[7:6];
 				1: attr_file_pal_wr <= attr_chr_data[5:4];
 				2: attr_file_pal_wr <= attr_chr_data[3:2];
@@ -796,33 +835,38 @@ end
 
 reg [14:0] lcd_data_r;
 reg [1:0] pal_no;
-reg lcd_clkena_r, lcd_on_r;
+reg lcd_clkena_r, lcd_on_r, lcd_vsync_r;
 reg [1:0] lcd_mode_r;
+reg [1:0] mask_en_r;
 wire [1:0] lcd_data_2 = lcd_data_r[1:0];
 // Lcd pixel output
 always @(posedge clk_sys) begin
 	if (ce) begin
+
+		if (lcd_off) mask_en_r <= mask_en;
 
 		pal_no <= attr_file[tile_number*2 +: 2];
 		lcd_data_r <= lcd_data;
 		lcd_clkena_r <= lcd_clkena;
 		lcd_mode_r <= lcd_mode;
 		lcd_on_r <= lcd_on;
+		lcd_vsync_r <= lcd_vsync;
 
-		if (~sgb_en | ((~output_sgb_pal | tint) & !mask_en) ) begin
+		if (~sgb_en | ((~output_sgb_pal | tint) & !mask_en_r) ) begin
 			sgb_lcd_data <= lcd_data_r;
-		end else if (mask_en == 2'd2) begin
+		end else if (mask_en_r == 2'd2) begin
 			sgb_lcd_data <= 0;
-		end else if (!lcd_data_2 || mask_en == 2'd3) begin
+		end else if (!lcd_data_2 || mask_en_r == 2'd3) begin
 			sgb_lcd_data <= palette[0][0:14];
 		end else begin
 			sgb_lcd_data <= palette[pal_no][lcd_data_2*15 +:15];
 		end
 
-		sgb_lcd_clkena <= (mask_en != 2'd1) ? lcd_clkena_r : 1'b0;
+		sgb_lcd_clkena <= (~sgb_en || mask_en_r != 2'd1) ? lcd_clkena_r : 1'b0;
 		sgb_lcd_mode <= lcd_mode_r;
 		sgb_lcd_on <= lcd_on_r;
-		sgb_pal_en <= sgb_en & (output_sgb_pal || |mask_en);
+		sgb_pal_en <= sgb_en & ( (output_sgb_pal & ~tint) || |mask_en_r);
+		sgb_lcd_vsync <= lcd_vsync_r;
 	end
 
 end

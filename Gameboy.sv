@@ -40,8 +40,8 @@ module emu
 	output        CE_PIXEL,
 
 	//Video aspect ratio for HDMI. Most retro systems have ratio 4:3.
-	output  [7:0] VIDEO_ARX,
-	output  [7:0] VIDEO_ARY,
+	output [11:0] VIDEO_ARX,
+	output [11:0] VIDEO_ARY,
 
 	output  [7:0] VGA_R,
 	output  [7:0] VGA_G,
@@ -51,6 +51,7 @@ module emu
 	output        VGA_DE,    // = ~(VBlank | HBlank)
 	output        VGA_F1,
 	output  [1:0] VGA_SL,
+	output        VGA_SCALER, // Force VGA scaler
 
 	output        LED_USER,  // 1 - ON, 0 - OFF.
 
@@ -137,14 +138,12 @@ assign LED_USER  = ioctl_download | sav_pending;
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
 assign BUTTONS   = 0;
+assign VGA_SCALER= 0;
 
-assign VIDEO_ARX = status[4:3] == 2'b10 ? 8'd16:
-						 status[4:3] == 2'b01 ? 8'd10:
-						 8'd4;
-						 
-assign VIDEO_ARY = status[4:3] == 2'b10 ? 8'd9:
-						 status[4:3] == 2'b01 ? 8'd9:
-						 8'd3;
+wire [1:0] ar = status[4:3];
+
+assign VIDEO_ARX = (!ar) ? 12'd10 : (ar - 1'd1);
+assign VIDEO_ARY = (!ar) ? 12'd9  : 12'd0;
 
 assign AUDIO_MIX = status[8:7];
 
@@ -152,7 +151,7 @@ assign AUDIO_MIX = status[8:7];
 // 0         1         2         3 
 // 01234567890123456789012345678901
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// XXXXXXXXXXX XXXX XXXX  XX
+// XXXXXXXXXXXXXXXXXXXXX  XXXX
 
 `include "build_id.v" 
 localparam CONF_STR = {
@@ -165,23 +164,27 @@ localparam CONF_STR = {
 	"h0OH,Cheats enabled,Yes,No;",
 	"-;",
 	"OC,Inverted color,No,Yes;",
-	"O1,Palette,Auto,Custom;",
+	"O12,Custom Palette,Off,Auto,On;",
 	"h1F2,GBP,Load Palette;",
 	"-;",
 	"h2R9,Load Backup RAM;",
 	"h2RA,Save Backup RAM;",
 	"OD,Autosave,Off,On;",
 	"-;",
-	"O34,Aspect ratio,4:3,10:9,16:9;",
+	"O34,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"OIK,Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
 	"O5,Stabilize video(buffer),Off,On;",
+	"OG,Frame blend,Off,On;",
 	"O78,Stereo mix,none,25%,50%,100%;",
 	"-;",
-	"O2,Boot,Normal,Fast;",
+	"OB,Boot,Normal,Fast;",
 	"O6,Link Port,Disabled,Enabled;",
 	"-;",
+	"OP,FastForward Sound,On,Off;",
+	"OQ,Pause when OSD is open,Off,On;",
+	"-;",
 	"R0,Reset;",
-	"J1,A,B,Select,Start;",
+	"J1,A,B,Select,Start,FastForward;",
 	"V,v",`BUILD_DATE
 };
 
@@ -215,8 +218,8 @@ wire [24:0] ioctl_addr;
 wire [15:0] ioctl_dout;
 reg         ioctl_wait;
 
-wire [15:0] joystick_0, joystick_1;
-wire [15:0] joystick = joystick_0 | joystick_1;
+wire [15:0] joystick_0, joystick_1, joystick_2, joystick_3;
+
 wire [7:0]  filetype;
 
 reg  [31:0] sd_lba;
@@ -260,13 +263,15 @@ hps_io #(.STRLEN($size(CONF_STR)>>3), .WIDE(1)) hps_io
 
 	.buttons(buttons),
 	.status(status),
-	.status_menumask({sav_supported,tint,gg_available}),
+	.status_menumask({sav_supported,|tint,gg_available}),
 	.direct_video(direct_video),
 	.gamma_bus(gamma_bus),
 	.forced_scandoubler(forced_scandoubler),
 
 	.joystick_0(joystick_0),
-	.joystick_1(joystick_1)
+	.joystick_1(joystick_1),
+	.joystick_2(joystick_2),
+	.joystick_3(joystick_3)
 );
 
 ///////////////////////////////////////////////////
@@ -281,6 +286,8 @@ wire [15:0] sdram_di = cart_download ? ioctl_dout : 16'd0;
 wire [23:0] sdram_addr = cart_download? ioctl_addr[24:1]: {2'b00, mbc_bank, cart_addr[12:1]};
 wire sdram_oe = ~cart_download & cart_rd & ~cram_rd;
 wire sdram_we = cart_download & dn_write;
+wire sdram_refresh_force;
+wire sdram_autorefresh = !fastforward;
 
 assign SDRAM_CKE = 1;
 
@@ -307,6 +314,8 @@ sdram sdram (
    .ds             ( sdram_ds                  ),
    .we             ( sdram_we                  ),
    .oe             ( sdram_oe                  ),
+   .autorefresh    ( sdram_autorefresh         ),
+   .refresh        ( sdram_refresh_force       ),
    .dout           ( sdram_do                  )
 );
 
@@ -338,49 +347,45 @@ end
 // ----------------------------- MBC1 ----------------------------
 // ---------------------------------------------------------------
 
-wire [9:0] mbc1_addr = 
-	(cart_addr[15:14] == 2'b00)?{9'd0, cart_addr[13]}:        				// 16k ROM Bank 0
-	(cart_addr[15:14] == 2'b01)?{2'b00, mbc1_rom_bank, cart_addr[13]}: 	// 16k ROM Bank 1-127
-	9'd0;
-	
-wire [9:0] mbc2_addr = 
-	(cart_addr[15:14] == 2'b00)?{9'd0, cart_addr[13]}:        				// 16k ROM Bank 0
-	(cart_addr[15:14] == 2'b01)?{2'b00, mbc2_rom_bank, cart_addr[13]}:	// 16k ROM Bank 1-15
-	9'd0;
-	
-wire [9:0] mbc3_addr = 
-	(cart_addr[15:14] == 2'b00)?{9'd0, cart_addr[13]}:        				// 16k ROM Bank 0
-	(cart_addr[15:14] == 2'b01)?{2'b00,mbc3_rom_bank, cart_addr[13]}:  	// 16k ROM Bank 1-127
-	9'd0;
+wire [9:0] mbc1_addr = {2'b00, mbc1_rom_bank, cart_addr[13]};	// 16k ROM Bank 0-127 or MBC1M Bank 0-63
 
-wire [9:0] mbc5_addr = 
-	(cart_addr[15:14] == 2'b00)?{9'd0, cart_addr[13]}:        				// 16k ROM Bank 0
-	(cart_addr[15:14] == 2'b01)?{mbc5_rom_bank, cart_addr[13]}:       	// 16k ROM Bank 0-480 (0h-1E0h)
-	9'd0;
-	
+wire [9:0] mbc2_addr = {2'b00, mbc2_rom_bank, cart_addr[13]};	// 16k ROM Bank 0-15
+
+wire [9:0] mbc3_addr = {2'b00, mbc3_rom_bank, cart_addr[13]};	// 16k ROM Bank 0-127
+
+wire [9:0] mbc5_addr = {       mbc5_rom_bank, cart_addr[13]};	// 16k ROM Bank 0-480 (0h-1E0h)
+
+// https://forums.nesdev.com/viewtopic.php?p=168940#p168940
+// https://gekkio.fi/files/gb-docs/gbctr.pdf
+// MBC1 $6000 Mode register:
+// 0: Bank2 ANDed with CPU A14. Bank2 affects ROM 0x4000-0x7FFF only
+// 1: Passthrough. Bank2 affects ROM 0x0000-0x3FFF, 0x4000-0x7FFF, RAM 0xA000-0xBFFF
+wire [1:0] mbc1_bank2 = mbc_ram_bank_reg[1:0] & {2{cart_addr[14] | mbc1_mode}};
+
 // -------------------------- RAM banking ------------------------
 
-// in mode 0 (16/8 mode) the ram is not banked 
-// in mode 1 (4/32 mode) four ram banks are used
-wire [1:0] mbc1_ram_bank = (mbc1_mode?mbc_ram_bank_reg[1:0]:2'b00) & ram_mask[1:0];
+wire [1:0] mbc1_ram_bank = mbc1_bank2 & ram_mask[1:0];
 wire [1:0] mbc3_ram_bank = mbc_ram_bank_reg[1:0] & ram_mask[1:0];
 wire [3:0] mbc5_ram_bank = mbc_ram_bank_reg & ram_mask;
 
 // -------------------------- ROM banking ------------------------
    
-// in mode 0 (16/8 mode) the ram bank select signals are the upper rom address lines 
-// in mode 1 (4/32 mode) the upper two rom address lines are 2'b00
-wire [6:0] mbc1_rom_bank_mode = { mbc1_mode?2'b00:mbc_ram_bank_reg[1:0], mbc_rom_bank_reg[4:0]};
+// 0x0000-0x3FFF = Bank 0
+wire [8:0] mbc_rom_bank = (cart_addr[15:14] == 2'b00) ? 9'd0 : mbc_rom_bank_reg;
+
+// MBC1: 4x32 16KByte banks, MBC1M: 4x16 16KByte banks
+wire [6:0] mbc1_rom_bank_mode = mbc1m ? { 1'b0, mbc1_bank2, mbc_rom_bank[3:0] }
+                                      : {       mbc1_bank2, mbc_rom_bank[4:0] };
 
 // in mode 0 map memory at A000-BFFF
 // in mode 1 map rtc register at A000-BFFF
 //wire [6:0] mbc3_ram_bank_addr = { mbc3_mode?2'b00:mbc3_ram_bank_reg, mbc3_rom_bank_reg};
 
 // mask address lines to enable proper mirroring
-wire [6:0] mbc1_rom_bank = mbc1_rom_bank_mode & rom_mask[6:0];		 //128
-wire [6:0] mbc2_rom_bank = mbc_rom_bank_reg[6:0] & rom_mask[6:0];  //16
-wire [6:0] mbc3_rom_bank = mbc_rom_bank_reg[6:0] & rom_mask[6:0];  //128
-wire [8:0] mbc5_rom_bank = mbc_rom_bank_reg & rom_mask;  //480
+wire [6:0] mbc1_rom_bank = mbc1_rom_bank_mode & rom_mask[6:0];	 //128
+wire [6:0] mbc2_rom_bank = mbc_rom_bank[6:0] & rom_mask[6:0];  //16
+wire [6:0] mbc3_rom_bank = mbc_rom_bank[6:0] & rom_mask[6:0];  //128
+wire [8:0] mbc5_rom_bank = mbc_rom_bank & rom_mask;  //480
 
 wire mbc_battery = (cart_mbc_type == 8'h03) || (cart_mbc_type == 8'h06) || (cart_mbc_type == 8'h09) || (cart_mbc_type == 8'h0D) ||
 	(cart_mbc_type == 8'h10) || (cart_mbc_type == 8'h13) || (cart_mbc_type == 8'h1B) || (cart_mbc_type == 8'h1E) ||
@@ -452,6 +457,7 @@ reg [7:0] cart_ram_size;
 reg [7:0] cart_cgb_flag;
 reg [7:0] cart_sgb_flag;
 reg [7:0] cart_old_licensee;
+reg [15:0] cart_logo_data[0:7];
 
 // RAM size
 wire [3:0] ram_mask =               	// 0 - no ram
@@ -501,21 +507,39 @@ wire isSGB_game = (cart_sgb_flag == 8'h03 && cart_old_licensee == 8'h33);
 
 reg [127:0] palette = 128'h828214517356305A5F1A3B4900000000;
 
+// MBC1M detect
+reg [7:0] cart_logo_check;
+reg [2:0] cart_logo_idx;
+wire mbc1m = &cart_logo_check;
+
 always @(posedge clk_sys) begin
-	if(!pll_locked) begin
-		cart_mbc_type <= 8'h00;
-		cart_rom_size <= 8'h00;
-		cart_ram_size <= 8'h00;
-	end else begin
-		if(cart_download & ioctl_wr) begin
-			case(ioctl_addr)
-				'h142: cart_cgb_flag <= ioctl_dout[15:8];
-				'h146: {cart_mbc_type, cart_sgb_flag} <= ioctl_dout;
-				'h148: { cart_ram_size, cart_rom_size } <= ioctl_dout;
-				'h14a: { cart_old_licensee } <= ioctl_dout[15:8];
-			endcase
-		end 
+	if(~old_downloading & downloading) begin
+		cart_logo_idx <= 3'd0;
+		cart_logo_check <= 8'd0;
 	end
+
+	if(cart_download & ioctl_wr) begin
+		case(ioctl_addr)
+			'h142: cart_cgb_flag <= ioctl_dout[15:8];
+			'h146: {cart_mbc_type, cart_sgb_flag} <= ioctl_dout;
+			'h148: { cart_ram_size, cart_rom_size } <= ioctl_dout;
+			'h14a: { cart_old_licensee } <= ioctl_dout[15:8];
+		endcase
+
+		//Store cart logo data
+		if (ioctl_addr >= 'h104 && ioctl_addr <= 'h112) begin
+			cart_logo_data[cart_logo_idx] <= ioctl_dout;
+			cart_logo_idx <= cart_logo_idx + 1'b1;
+		end
+
+		// MBC1 Multicart detect: Compare 8 words of logo data at second 256KByte bank
+		if (ioctl_addr >= 'h40104 && ioctl_addr <= 'h40112) begin
+			cart_logo_check[cart_logo_idx] <= (ioctl_dout == cart_logo_data[cart_logo_idx]);
+			cart_logo_idx <= cart_logo_idx + 1'b1;
+		end
+
+	end
+
 	if (palette_download & ioctl_wr) begin
 			palette[127:0] <= {palette[111:0], ioctl_dout[7:0], ioctl_dout[15:8]};
 	end
@@ -541,6 +565,7 @@ wire lcd_clkena;
 wire [14:0] lcd_data;
 wire [1:0] lcd_mode;
 wire lcd_on;
+wire lcd_vsync;
 
 assign AUDIO_S = 0;
 
@@ -553,6 +578,9 @@ always @(posedge clk_sys) if(reset) begin
 	else if(cart_download) isGBC <= !filetype[7:4];
 end
 
+wire [15:0] GB_AUDIO_L;
+wire [15:0] GB_AUDIO_R;
+
 // the gameboy itself
 gb gb (
 	.reset	    ( reset      ),
@@ -561,13 +589,13 @@ gb gb (
 	.ce          ( ce_cpu     ),   // the whole gameboy runs on 4mhnz
 	.ce_2x       ( ce_cpu2x   ),   // ~8MHz in dualspeed mode (GBC)
 	
-	.fast_boot   ( status[2]  ),
-	.joystick    ( joystick   ),
+	.fast_boot   ( status[11]  ),
+
 	.isGBC       ( isGBC      ),
 	.isGBC_game  ( isGBC_game ),
 
-	.joy_p54     (joy_p54     ),
-	.joy_sgb     (joy_do_sgb  ),
+	.joy_p54     ( joy_p54     ),
+	.joy_din     ( joy_do_sgb  ),
 
 	// interface to the "external" game cartridge
 	.cart_addr   ( cart_addr  ),
@@ -581,14 +609,15 @@ gb gb (
 	.gbc_bios_do     ( bios_do    ),
 
 	// audio
-	.audio_l 	 ( AUDIO_L	  ),
-	.audio_r 	 ( AUDIO_R	  ),
+	.audio_l 	 ( GB_AUDIO_L ),
+	.audio_r 	 ( GB_AUDIO_R ),
 	
 	// interface to the lcd
 	.lcd_clkena  ( lcd_clkena ),
 	.lcd_data    ( lcd_data   ),
 	.lcd_mode    ( lcd_mode   ),
 	.lcd_on      ( lcd_on     ),
+	.lcd_vsync   ( lcd_vsync  ),
 	.speed       ( speed      ),
 	
 	// serial port
@@ -597,7 +626,6 @@ gb gb (
 	.serial_data_in(ser_data_in),
 	.serial_clk_out(ser_clk_out),
 	.serial_data_out(ser_data_out),
-	.serial_ena(status[6]),
 	
 	// Palette download will disable cheats option (HPS doesn't distinguish downloads),
 	// so clear the cheats and disable second option (chheats enable/disable)
@@ -607,28 +635,35 @@ gb gb (
 	.gg_available(gg_available)
 );
 
+assign AUDIO_L = (joystick_0[8] && status[25]) ? 16'd0 : GB_AUDIO_L;
+assign AUDIO_R = (joystick_0[8] && status[25]) ? 16'd0 : GB_AUDIO_R;
+
 // the lcd to vga converter
 wire [7:0] video_r, video_g, video_b;
 wire video_hs, video_vs;
 wire HBlank, VBlank;
 wire ce_pix;
 wire [8:0] h_cnt, v_cnt;
-wire tint = status[1];
+wire [1:0] tint = status[2:1];
 
 lcd lcd
 (
 	// serial interface
 	.clk_sys( clk_sys    ),
-	.pix_wr ( sgb_lcd_clkena & ce_cpu ),
+	.ce     ( ce_cpu         ),
+
+	.lcd_clkena ( sgb_lcd_clkena ),
 	.data   ( sgb_lcd_data   ),
 	.mode   ( sgb_lcd_mode   ),  // used to detect begin of new lines and frames
 	.on     ( sgb_lcd_on     ),
+	.lcd_vs ( sgb_lcd_vsync  ),
 
 	.isGBC  ( isGBC      ),
 
-	.tint   ( tint  ),
+	.tint   ( |tint       ),
 	.inv    ( status[12]  ),
 	.double_buffer( status[5]),
+	.frame_blend( status[16] ),
 
 	// Palettes
 	.pal1   (palette[127:104]),
@@ -653,10 +688,11 @@ lcd lcd
 	.v_cnt  ( v_cnt      )
 );
 
-wire [5:0] joy_p54, joy_do_sgb;
+wire [1:0] joy_p54;
+wire [3:0] joy_do_sgb;
 wire [14:0] sgb_lcd_data;
 wire [15:0] sgb_border_pix;
-wire sgb_lcd_clkena, sgb_lcd_on;
+wire sgb_lcd_clkena, sgb_lcd_on, sgb_lcd_vsync;
 wire [1:0] sgb_lcd_mode;
 wire sgb_pal_en;
 wire [1:0] sgb_en = {~status[24] ^ status[23], status[23]};
@@ -669,16 +705,21 @@ sgb sgb (
 	.clk_vid     ( CLK_VIDEO   ),
 	.ce_pix      ( ce_pix      ),
 
-	.joy_di      ( joy_p54     ),
+	.joystick_0  ( joystick_0  ),
+	.joystick_1  ( joystick_1  ),
+	.joystick_2  ( joystick_2  ),
+	.joystick_3  ( joystick_3  ),
+	.joy_p54     ( joy_p54     ),
 	.joy_do      ( joy_do_sgb  ),
 
 	.sgb_en      ( ~sgb_en[1] & isSGB_game & ~isGBC ),
-	.tint        ( tint  ),
+	.tint        ( tint[1]     ),
 
 	.lcd_on      ( lcd_on      ),
 	.lcd_clkena  ( lcd_clkena  ),
 	.lcd_data    ( lcd_data    ),
 	.lcd_mode    ( lcd_mode    ),
+	.lcd_vsync   ( lcd_vsync   ),
 
 	.h_cnt       ( h_cnt      ),
 	.v_cnt       ( v_cnt      ),
@@ -688,7 +729,8 @@ sgb sgb (
 	.sgb_lcd_data    ( sgb_lcd_data    ),
 	.sgb_lcd_on      ( sgb_lcd_on      ),
 	.sgb_lcd_clkena  ( sgb_lcd_clkena  ),
-	.sgb_lcd_mode    ( sgb_lcd_mode    )
+	.sgb_lcd_mode    ( sgb_lcd_mode    ),
+	.sgb_lcd_vsync   ( sgb_lcd_vsync   )
 );
 
 reg hs_o, vs_o;
@@ -726,14 +768,28 @@ video_mixer #(.LINE_LENGTH(200), .GAMMA(1)) video_mixer
 
 //////////////////////////////// CE ////////////////////////////////////
 
-reg ce_cpu, ce_cpu2x;
-always @(negedge clk_sys) begin
-	reg [2:0] div = 0;
 
-	div      <= div + 1'd1;
-	ce_cpu2x <= !div[1:0];
-	ce_cpu   <= !div[2:0];
+wire ce_cpu, ce_cpu2x;
+wire cart_act = cart_wr | cart_rd;
+
+wire fastforward = joystick_0[8] && !ioctl_download && !OSD_STATUS;
+
+reg paused;
+always_ff @(posedge clk_sys) begin
+   paused <= status[26] && OSD_STATUS && !ioctl_download && !reset;
 end
+
+speedcontrol speedcontrol
+(
+	.clk_sys     (clk_sys),
+	.speed       (speed),
+	.pause       (paused),
+	.speedup     (fastforward),
+	.cart_act    (cart_act),
+	.ce          (ce_cpu),
+	.ce_2x       (ce_cpu2x),
+	.refresh     (sdram_refresh_force)
+);
 
 ///////////////////////////// GBC BIOS /////////////////////////////////
 
@@ -796,12 +852,13 @@ wire ser_data_in;
 wire ser_data_out;
 wire ser_clk_in;
 wire ser_clk_out;
+wire serial_ena = status[6];
 
-assign ser_data_in = USER_IN[2];	
-assign USER_OUT[1] = ser_data_out;
+assign ser_data_in = serial_ena ? USER_IN[2] : 1'b1;
+assign USER_OUT[1] = serial_ena ? ser_data_out : 1'b1;
 
-assign ser_clk_in = USER_IN[0];
-assign USER_OUT[0] = sc_int_clock_out?ser_clk_out:1'b1;
+assign ser_clk_in = serial_ena ? USER_IN[0] : 1'b1;
+assign USER_OUT[0] = (serial_ena & sc_int_clock_out) ? ser_clk_out : 1'b1;
 
 
 /////////////////////////////  RTC  ///////////////////////////////

@@ -127,7 +127,6 @@ module emu
 );
 
 assign ADC_BUS  = 'Z;
-assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0; 
 assign VGA_F1 = 0;
 
 assign {UART_RTS, UART_TXD, UART_DTR} = 0;
@@ -151,11 +150,11 @@ assign AUDIO_MIX = status[8:7];
 // 0         1         2         3 
 // 01234567890123456789012345678901
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// XXXXXXXXXXXXXXXXXXXXX  XXXX
+// XXXXXXXXXXXXXXXXXXXXX  XXXXXXX
 
 `include "build_id.v" 
 localparam CONF_STR = {
-	"GAMEBOY;;",
+	"GAMEBOY;SS3E000000:100000;",
 	"FS1,GBCGB ,Load ROM;",
 	"OEF,System,Auto,Gameboy,Gameboy Color;",
 	"ONO,Super Game Boy,Off,Palette,On;",
@@ -171,6 +170,9 @@ localparam CONF_STR = {
 	"h2RA,Save Backup RAM;",
 	"OD,Autosave,Off,On;",
 	"-;",
+	"h3RS,Save state (Alt-F1);",
+	"h3RT,Restore state (F1);",
+	"-;",
 	"O34,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"OIK,Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
 	"O5,Stabilize video(buffer),Off,On;",
@@ -182,9 +184,20 @@ localparam CONF_STR = {
 	"-;",
 	"OP,FastForward Sound,On,Off;",
 	"OQ,Pause when OSD is open,Off,On;",
+	"OR,Rewind Capture,Off,On;",
 	"-;",
 	"R0,Reset;",
-	"J1,A,B,Select,Start,FastForward;",
+	"J1,A,B,Select,Start,FastForward,SaveState,LoadState,Rewind;",
+	"I,",
+	"Save to state 1,",
+	"Restore state 1,",
+	"Save to state 2,",
+	"Restore state 2,",
+	"Save to state 3,",
+	"Restore state 3,",
+	"Save to state 4,",
+	"Restore state 4,",
+	"Rewinding...;",
 	"V,v",`BUILD_DATE
 };
 
@@ -219,6 +232,7 @@ wire [15:0] ioctl_dout;
 reg         ioctl_wait;
 
 wire [15:0] joystick_0, joystick_1, joystick_2, joystick_3;
+wire [10:0] ps2_key;
 
 wire [7:0]  filetype;
 
@@ -263,7 +277,7 @@ hps_io #(.STRLEN($size(CONF_STR)>>3), .WIDE(1)) hps_io
 
 	.buttons(buttons),
 	.status(status),
-	.status_menumask({sav_supported,|tint,gg_available}),
+	.status_menumask({cart_ready,sav_supported,|tint,gg_available}),
 	.direct_video(direct_video),
 	.gamma_bus(gamma_bus),
 	.forced_scandoubler(forced_scandoubler),
@@ -271,7 +285,12 @@ hps_io #(.STRLEN($size(CONF_STR)>>3), .WIDE(1)) hps_io
 	.joystick_0(joystick_0),
 	.joystick_1(joystick_1),
 	.joystick_2(joystick_2),
-	.joystick_3(joystick_3)
+	.joystick_3(joystick_3),
+	
+	.ps2_key(ps2_key),
+	
+	.info_req(ss_info_req),
+	.info(ss_info)
 );
 
 ///////////////////////////////////////////////////
@@ -287,7 +306,7 @@ wire [23:0] sdram_addr = cart_download? ioctl_addr[24:1]: {2'b00, mbc_bank, cart
 wire sdram_oe = ~cart_download & cart_rd & ~cram_rd;
 wire sdram_we = cart_download & dn_write;
 wire sdram_refresh_force;
-wire sdram_autorefresh = !fastforward;
+wire sdram_autorefresh = !ff_on;
 
 assign SDRAM_CKE = 1;
 
@@ -398,14 +417,25 @@ reg mbc3_mode;
 reg [8:0] mbc_rom_bank_reg;
 reg [3:0] mbc_ram_bank_reg; //0-15
 
+assign SS_Ext_BACK[ 8: 0] = mbc_rom_bank_reg;
+assign SS_Ext_BACK[12: 9] = mbc_ram_bank_reg;
+assign SS_Ext_BACK[   13] = mbc1_mode;
+assign SS_Ext_BACK[   14] = mbc3_mode;
+assign SS_Ext_BACK[   15] = mbc_ram_enable;
 
 always @(posedge clk_sys) begin
-	if(reset) begin
+	if(savestate_load) begin
+		mbc_rom_bank_reg <= SS_Ext[ 8: 0]; //5'd1;
+		mbc_ram_bank_reg <= SS_Ext[12: 9]; //4'd0;
+		mbc1_mode        <= SS_Ext[   13]; //1'b0;
+		mbc3_mode        <= SS_Ext[   14]; //1'b0;
+		mbc_ram_enable   <= SS_Ext[   15]; //1'b0;
+	end else if(reset) begin
 		mbc_rom_bank_reg <= 5'd1;
 		mbc_ram_bank_reg <= 4'd0;
-		mbc1_mode <= 1'b0;
-		mbc3_mode <= 1'b0;
-		mbc_ram_enable <= 1'b0;
+		mbc1_mode        <= 1'b0;
+		mbc3_mode        <= 1'b0;
+		mbc_ram_enable   <= 1'b0;
 	end else if(ce_cpu2x) begin
 		
 		//write to ROM bank register
@@ -567,6 +597,8 @@ wire [1:0] lcd_mode;
 wire lcd_on;
 wire lcd_vsync;
 
+wire HDMA_on;
+
 assign AUDIO_S = 0;
 
 wire reset = (RESET | status[0] | buttons[1] | cart_download | bk_loading);
@@ -618,7 +650,9 @@ gb gb (
 	.lcd_mode    ( lcd_mode   ),
 	.lcd_on      ( lcd_on     ),
 	.lcd_vsync   ( lcd_vsync  ),
+	
 	.speed       ( speed      ),
+	.HDMA_on     ( HDMA_on    ),
 	
 	// serial port
 	.sc_int_clock2(sc_int_clock_out),
@@ -632,7 +666,37 @@ gb gb (
 	.gg_reset((code_download && ioctl_wr && !ioctl_addr) | cart_download | palette_download),
 	.gg_en(~status[17]),
 	.gg_code(gg_code),
-	.gg_available(gg_available)
+	.gg_available(gg_available),
+	
+	// savestates
+	.cart_ram_size   (cart_ram_size),
+	.save_state      (ss_save),
+	.load_state      (ss_load),
+	.savestate_number(ss_base),
+	.sleep_savestate (sleep_savestate),
+	.state_loaded    (ss_loaded),
+	
+	.SaveStateExt_Din (SaveStateBus_Din),
+	.SaveStateExt_Adr (SaveStateBus_Adr), 
+	.SaveStateExt_wren(SaveStateBus_wren),
+	.SaveStateExt_rst (SaveStateBus_rst),
+	.SaveStateExt_Dout(SaveStateBus_Dout),
+	.SaveStateExt_load(savestate_load),
+	
+	.Savestate_CRAMAddr     (Savestate_CRAMAddr),     
+	.Savestate_CRAMRWrEn    (Savestate_CRAMRWrEn),   
+	.Savestate_CRAMWriteData(Savestate_CRAMWriteData),
+	.Savestate_CRAMReadData (Savestate_CRAMReadData),
+	
+	.SAVE_out_Din(ss_din),            // data read from savestate
+	.SAVE_out_Dout(ss_dout),          // data written to savestate
+	.SAVE_out_Adr(ss_addr),           // all addresses are DWORD addresses!
+	.SAVE_out_rnw(ss_rnw),            // read = 1, write = 0
+	.SAVE_out_ena(ss_req),            // one cycle high for each action
+	.SAVE_out_done(ss_ack),            // should be one cycle high when write is done or read value is valid
+	
+	.rewind_on(status[27]),
+	.rewind_active(status[27] & joystick_0[11])
 );
 
 assign AUDIO_L = (joystick_0[8] && status[25]) ? 16'd0 : GB_AUDIO_L;
@@ -773,23 +837,144 @@ wire ce_cpu, ce_cpu2x;
 wire cart_act = cart_wr | cart_rd;
 
 wire fastforward = joystick_0[8] && !ioctl_download && !OSD_STATUS;
+wire ff_on;
+
+wire sleep_savestate;
 
 reg paused;
 always_ff @(posedge clk_sys) begin
-   paused <= status[26] && OSD_STATUS && !ioctl_download && !reset;
+   paused <= sleep_savestate | (status[26] && OSD_STATUS && !ioctl_download && !reset && ~status[27]); // no pause when downloading rom, resetting or rewind capture is on
 end
 
 speedcontrol speedcontrol
 (
 	.clk_sys     (clk_sys),
-	.speed       (speed),
 	.pause       (paused),
-	.speedup     (fastforward),
+	.speedup     (fast_forward),
 	.cart_act    (cart_act),
+	.HDMA_on     (HDMA_on),
 	.ce          (ce_cpu),
 	.ce_2x       (ce_cpu2x),
-	.refresh     (sdram_refresh_force)
+	.refresh     (sdram_refresh_force),
+	.ff_on       (ff_on)
 );
+
+///////////////////////////// Fast Forward Latch /////////////////////////////////
+
+reg fast_forward;
+reg ff_latch;
+
+always @(posedge clk_sys) begin : ffwd
+	reg last_ffw;
+	reg ff_was_held;
+	longint ff_count;
+
+	last_ffw <= fastforward;
+
+	if (fastforward)
+		ff_count <= ff_count + 1;
+
+	if (~last_ffw & fastforward) begin
+		ff_latch <= 0;
+		ff_count <= 0;
+	end
+
+	if ((last_ffw & ~fastforward)) begin // 32mhz clock, 0.2 seconds
+		ff_was_held <= 0;
+
+		if (ff_count < 3200000 && ~ff_was_held) begin
+			ff_was_held <= 1;
+			ff_latch <= 1;
+		end
+	end
+
+	fast_forward <= (fastforward | ff_latch);
+end
+
+///////////////////////////// savestates /////////////////////////////////
+
+wire [63:0] SaveStateBus_Din; 
+wire [9:0]  SaveStateBus_Adr; 
+wire        SaveStateBus_wren;
+wire        SaveStateBus_rst; 
+wire [63:0] SaveStateBus_Dout;
+wire        savestate_load;
+
+wire [19:0] Savestate_CRAMAddr;     
+wire        Savestate_CRAMRWrEn;    
+wire [7:0]  Savestate_CRAMWriteData;
+wire [7:0]  Savestate_CRAMReadData;
+	
+wire [15:0] SS_Ext;
+wire [15:0] SS_Ext_BACK;
+
+eReg_SavestateV #(0, 32, 15, 0, 64'h0000000000000001) iREG_SAVESTATE_Ext (clk_sys, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren, SaveStateBus_rst, SaveStateBus_Dout, SS_Ext_BACK, SS_Ext);  
+
+wire [63:0] ss_dout, ss_din;
+wire [27:2] ss_addr;
+wire        ss_rnw, ss_req, ss_ack;
+
+assign DDRAM_CLK = clk_sys;
+ddram ddram
+(
+	.*,
+
+	.ch1_addr({ss_addr, 1'b0}),
+	.ch1_din(ss_din),
+	.ch1_dout(ss_dout),
+	.ch1_req(ss_req),
+	.ch1_rnw(ss_rnw),
+	.ch1_ready(ss_ack)
+);
+
+// saving with keyboard/OSD/gamepad
+wire       pressed = ps2_key[9];
+wire [7:0] code    = ps2_key[7:0];
+
+reg [1:0] ss_base = 0;
+reg [7:0] ss_info;
+reg ss_save, ss_load, ss_info_req;
+wire ss_loaded;
+always @(posedge clk_sys) begin
+	reg old_state;
+	reg alt = 0;
+	reg [1:0] old_st;
+	reg [1:0] old_st_joy;
+
+	old_state <= ps2_key[10];
+
+	if(cart_ready) begin
+		if(old_state != ps2_key[10]) begin
+			case(code)
+				'h11: alt <= pressed;
+				'h05: begin ss_save <= pressed & alt; ss_load <= pressed & ~alt; ss_base <= 0; end // F1
+				'h06: begin ss_save <= pressed & alt; ss_load <= pressed & ~alt; ss_base <= 1; end // F2
+				'h04: begin ss_save <= pressed & alt; ss_load <= pressed & ~alt; ss_base <= 2; end // F3
+				'h0C: begin ss_save <= pressed & alt; ss_load <= pressed & ~alt; ss_base <= 3; end // F4
+			endcase
+		end
+
+      old_st_joy <= joystick_0[10:9];
+		if(old_st_joy[0] ^ joystick_0[9])  ss_save <= joystick_0[9];
+		if(old_st_joy[1] ^ joystick_0[10]) ss_load <= joystick_0[10];
+      if(joystick_0[10:9]) ss_base <= 0;
+
+		old_st <= status[29:28];
+		if(old_st[0] ^ status[28]) ss_save <= status[28];
+		if(old_st[1] ^ status[29]) ss_load <= status[29];
+		if(status[29:28])    ss_base <= 0;
+
+		if(ss_load | ss_save) ss_info <= 7'd1 + {ss_base, ss_load};
+		ss_info_req <= (ss_loaded | ss_save);
+
+		// rewind info
+		if (status[27] & joystick_0[11]) begin
+			ss_info_req <= 1'b1;
+			ss_info     <= 7'd9;
+		end
+
+	end
+end
 
 ///////////////////////////// GBC BIOS /////////////////////////////////
 
@@ -991,17 +1176,28 @@ wire [7:0] cram_do =
 				cram_q :         // Return normal value
 		8'hFF;                   // Ram not enabled
 
+
+reg read_low = 0;
+always @(posedge clk_sys) begin
+   read_low <= cram_addr[0];
+end
+
+assign Savestate_CRAMReadData = read_low ? cram_q_h : cram_q_l;
+
 wire [7:0] cram_q = cram_addr[0] ? cram_q_h : cram_q_l;
 wire [7:0] cram_q_h;
 wire [7:0] cram_q_l;
 
 wire is_cram_addr = (cart_addr[15:13] == 3'b101);
 wire cram_rd = cart_rd & is_cram_addr;
-wire cram_wr = cart_wr & is_cram_addr;
-wire [16:0] cram_addr = mbc1? {2'b00,mbc1_ram_bank, cart_addr[12:0]}:
+wire cram_wr = sleep_savestate ? Savestate_CRAMRWrEn : cart_wr & is_cram_addr;
+wire [16:0] cram_addr = sleep_savestate ? Savestate_CRAMAddr[16:0]:
+                        mbc1? {2'b00,mbc1_ram_bank, cart_addr[12:0]}:
 								mbc3? {2'b00,mbc3_ram_bank, cart_addr[12:0]}:
 								mbc5?	{mbc5_ram_bank, cart_addr[12:0]}:
 								{4'd0, cart_addr[12:0]};
+
+wire [7:0] cram_di = sleep_savestate ? Savestate_CRAMWriteData : cart_di;
 
 // Up to 8kb * 16banks of Cart Ram (128kb)
 
@@ -1009,7 +1205,7 @@ dpram #(16) cram_l (
 	.clock_a (clk_sys),
 	.address_a (cram_addr[16:1]),
 	.wren_a (cram_wr & ~cram_addr[0]),
-	.data_a (cart_di),
+	.data_a (cram_di),
 	.q_a (cram_q_l),
 	
 	.clock_b (clk_sys),
@@ -1023,7 +1219,7 @@ dpram #(16) cram_h (
 	.clock_a (clk_sys),
 	.address_a (cram_addr[16:1]),
 	.wren_a (cram_wr & cram_addr[0]),
-	.data_a (cart_di),
+	.data_a (cram_di),
 	.q_a (cram_q_h),
 	
 	.clock_b (clk_sys),
